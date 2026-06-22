@@ -6,8 +6,11 @@ import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientResponseException;
@@ -15,101 +18,90 @@ import org.springframework.web.client.RestClientResponseException;
 import java.util.List;
 import java.util.UUID;
 
-/**
- * Calls the Django Admin & Vendor Service's internal stock reservation
- * endpoints during checkout. This is the second sanctioned synchronous
- * cross-service call in our architecture — overselling prevention requires
- * a confirmed, synchronous stock hold before an order can be created.
- *
- * This is NEVER called directly by a customer, vendor, or admin via
- * Postman/Swagger in normal use — it is called internally, in the
- * background, by CheckoutService the moment a customer hits checkout.
- */
 @Slf4j
 @Component
 public class InventoryReservationClient {
 
     private final RestClient restClient;
-    private final ObjectMapper debugMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper;
 
-    public InventoryReservationClient(@Value("${admin-service.base-url}") String baseUrl) {
-        org.apache.hc.client5.http.impl.classic.CloseableHttpClient httpClient =
-                org.apache.hc.client5.http.impl.classic.HttpClients.createDefault();
+    public InventoryReservationClient(
+            @Value("${admin-service.base-url}") String baseUrl,
+            ObjectMapper objectMapper
+    ) {
+        this.objectMapper = objectMapper;
 
-        org.springframework.http.client.HttpComponentsClientHttpRequestFactory factory =
-                new org.springframework.http.client.HttpComponentsClientHttpRequestFactory(httpClient);
+        CloseableHttpClient httpClient = HttpClients.createDefault();
+        HttpComponentsClientHttpRequestFactory factory =
+                new HttpComponentsClientHttpRequestFactory(httpClient);
 
         this.restClient = RestClient.builder()
                 .baseUrl(baseUrl)
                 .requestFactory(factory)
                 .build();
+
+        log.info("[InventoryReservationClient] Initialized. Base URL: {}", baseUrl);
     }
 
-    /**
-     * Reserves stock for all items. All-or-nothing on the Django side.
-     * Throws InsufficientStockException if any item cannot be reserved.
-     */
     public void reserveStock(List<ReservationItem> items) {
-        ReservationRequest req = new ReservationRequest(items);
-        logOutgoingPayload("reserve", req);
-
-        try {
-            restClient.post()
-                    .uri("/api/v1/inventory/internal/reserve/")
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(req)
-                    .retrieve()
-                    .toBodilessEntity();
-        } catch (RestClientResponseException e) {
-            if (e.getStatusCode().value() == 409) {
-                throw new InsufficientStockException("One or more items are out of stock.");
-            }
-            log.error("Stock reservation failed: {} - {}", e.getStatusCode(), e.getResponseBodyAsString());
-            throw new RuntimeException("Failed to reserve stock: " + e.getMessage());
-        }
+        String json = serialize(new ReservationRequest(items));
+        log.info("[InventoryClient][RESERVE] Sending: {}", json);
+        post("/api/v1/inventory/internal/reserve/", json, true);
     }
 
     public void releaseStock(List<ReservationItem> items) {
-        ReservationRequest req = new ReservationRequest(items);
-        logOutgoingPayload("release", req);
-
-        try {
-            restClient.post()
-                    .uri("/api/v1/inventory/internal/release/")
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(req)
-                    .retrieve()
-                    .toBodilessEntity();
-        } catch (RestClientResponseException e) {
-            log.error("Stock release failed (order will remain in inconsistent state, needs manual review): {} - {}",
-                    e.getStatusCode(), e.getResponseBodyAsString());
-        }
+        String json = serialize(new ReservationRequest(items));
+        log.info("[InventoryClient][RELEASE] Sending: {}", json);
+        post("/api/v1/inventory/internal/release/", json, false);
     }
 
     public void confirmSale(List<ReservationItem> items) {
-        ReservationRequest req = new ReservationRequest(items);
-        logOutgoingPayload("confirm", req);
+        String json = serialize(new ReservationRequest(items));
+        log.info("[InventoryClient][CONFIRM] Sending: {}", json);
+        post("/api/v1/inventory/internal/confirm/", json, true);
+    }
 
+    // ── Private helpers ──────────────────────────────────────────────────
+
+    /**
+     * Sends a pre-serialized JSON string as the request body.
+     * Using String body bypasses Spring's HttpMessageConverter pipeline entirely
+     * — what you see in the log is exactly what Django receives.
+     */
+    private void post(String uri, String jsonBody, boolean throwOn409) {
         try {
             restClient.post()
-                    .uri("/api/v1/inventory/internal/confirm/")
+                    .uri(uri)
                     .contentType(MediaType.APPLICATION_JSON)
-                    .body(req)
+                    .body(jsonBody)   // <-- String, not an object
                     .retrieve()
                     .toBodilessEntity();
         } catch (RestClientResponseException e) {
-            log.error("Sale confirmation failed: {} - {}", e.getStatusCode(), e.getResponseBodyAsString());
-            throw new RuntimeException("Failed to confirm sale: " + e.getMessage());
+            int status = e.getStatusCode().value();
+            String responseBody = e.getResponseBodyAsString();
+            log.error("[InventoryClient] HTTP {} from Django: {}", status, responseBody);
+
+            if (throwOn409 && status == 409) {
+                throw new InsufficientStockException("One or more items are out of stock.");
+            }
+            if (throwOn409) {
+                throw new RuntimeException(
+                        "Inventory call failed [" + status + "]: " + responseBody
+                );
+            }
+            // For release: log and swallow — don't crash the cancel flow
         }
     }
 
-    private void logOutgoingPayload(String operation, ReservationRequest req) {
+    private String serialize(Object obj) {
         try {
-            log.info("DEBUG [{}] - JSON being sent: {}", operation, debugMapper.writeValueAsString(req));
-        } catch (Exception jsonEx) {
-            log.error("DEBUG [{}] - Failed to serialize for logging", operation, jsonEx);
+            return objectMapper.writeValueAsString(obj);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize inventory request", e);
         }
     }
+
+    // ── DTOs ─────────────────────────────────────────────────────────────
 
     @Getter
     @NoArgsConstructor
@@ -117,6 +109,7 @@ public class InventoryReservationClient {
     public static class ReservationItem {
         @JsonProperty("product_id")
         private UUID productId;
+
         @JsonProperty("quantity")
         private Integer quantity;
     }

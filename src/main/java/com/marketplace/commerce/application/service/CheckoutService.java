@@ -46,6 +46,8 @@ public class CheckoutService {
 
     @Transactional
     public OrderResponseDto checkout(UUID customerId, CheckoutRequestDto request) {
+
+        // ── Step 1: Validate cart ────────────────────────────────────────────
         Cart cart = cartRepository.findByCustomerId(customerId)
                 .orElseThrow(() -> new IllegalStateException("Your cart is empty."));
 
@@ -53,7 +55,12 @@ public class CheckoutService {
             throw new IllegalStateException("Your cart is empty.");
         }
 
-        // Step 1: Resolve live product data for every cart item
+        // ── Step 2: Resolve address FIRST (fail fast before touching inventory)
+        // If the customer has no saved address this throws immediately —
+        // no stock has been touched yet so there is nothing to roll back.
+        String resolvedAddress = addressService.resolveAddressText(customerId, request.getAddressId());
+
+        // ── Step 3: Fetch live product data from Catalog Service ─────────────
         record ResolvedItem(UUID productId, UUID vendorId, Integer quantity, BigDecimal unitPrice) {}
 
         List<ResolvedItem> resolvedItems = cart.getItems().stream()
@@ -76,7 +83,9 @@ public class CheckoutService {
                 })
                 .toList();
 
-        // Step 2: Reserve stock synchronously — all or nothing
+        // ── Step 4: Reserve stock — all or nothing ───────────────────────────
+        // Only reached if address + product validation both passed.
+        // If reservation fails, @Transactional rolls back and no order is created.
         List<InventoryReservationClient.ReservationItem> reservationItems = resolvedItems.stream()
                 .map(item -> new InventoryReservationClient.ReservationItem(item.productId(), item.quantity()))
                 .toList();
@@ -87,12 +96,11 @@ public class CheckoutService {
             throw new IllegalStateException(e.getMessage());
         }
 
-        // Step 3: Build the order — reservation succeeded, safe to commit
+        // ── Step 5: Build and persist the order ──────────────────────────────
+        // Reservation succeeded — safe to commit the order now.
         BigDecimal totalAmount = resolvedItems.stream()
                 .map(item -> item.unitPrice().multiply(BigDecimal.valueOf(item.quantity())))
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        String resolvedAddress = addressService.resolveAddressText(customerId, request.getAddressId());
 
         Order order = Order.builder()
                 .customerId(customerId)
@@ -114,7 +122,7 @@ public class CheckoutService {
         order.setItems(orderItems);
         orderRepository.save(order);
 
-        // Step 4: Clear the cart now that the order is created
+        // ── Step 6: Clear the cart ───────────────────────────────────────────
         cart.getItems().clear();
         cartRepository.save(cart);
 

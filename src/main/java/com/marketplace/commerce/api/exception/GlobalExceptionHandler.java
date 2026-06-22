@@ -47,6 +47,16 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }
 
+    @ExceptionHandler(org.springframework.web.client.RestClientException.class)
+    public ResponseEntity<ApiResponseDto<Object>> handleExternalServiceError(
+            org.springframework.web.client.RestClientException ex, HttpServletRequest request) {
+        log.error("External service call failed on {}: {}", request.getRequestURI(), ex.getMessage());
+        ApiResponseDto<Object> body = ApiResponseDto.error(
+                "Payment service temporarily unavailable. Please try again.",
+                null, request.getRequestURI()
+        );
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(body);
+    }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiResponseDto<Object>> handleGeneric(
