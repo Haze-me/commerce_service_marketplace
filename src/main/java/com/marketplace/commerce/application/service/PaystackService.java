@@ -32,10 +32,12 @@ public class PaystackService {
     private final PaymentRepository paymentRepository;
     private final InventoryReservationClient inventoryReservationClient;
     private final ObjectMapper objectMapper;
+    private final String frontendBaseUrl;
 
     public PaystackService(
             @Value("${paystack.secret-key}") String secretKey,
             @Value("${paystack.base-url}") String baseUrl,
+            @Value("${app.frontend-base-url:http://localhost:5173}") String frontendBaseUrl,
             OrderRepository orderRepository,
             PaymentRepository paymentRepository,
             InventoryReservationClient inventoryReservationClient,
@@ -45,6 +47,7 @@ public class PaystackService {
         this.paymentRepository = paymentRepository;
         this.inventoryReservationClient = inventoryReservationClient;
         this.objectMapper = objectMapper;
+        this.frontendBaseUrl = frontendBaseUrl;
 
         this.paystackClient = RestClient.builder()
                 .baseUrl(baseUrl)
@@ -90,6 +93,10 @@ public class PaystackService {
         requestBody.put("amount", amountInKobo);
         requestBody.put("reference", reference);
         requestBody.put("currency", "NGN");
+        // Redirect the customer back to the app's payment page after Paystack,
+        // where the frontend auto-verifies. Without this Paystack shows its own
+        // success page and never returns to the app.
+        requestBody.put("callback_url", frontendBaseUrl + "/payment/" + orderId);
 
         String jsonBody;
         try {

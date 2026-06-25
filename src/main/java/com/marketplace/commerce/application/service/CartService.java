@@ -116,7 +116,12 @@ public class CartService {
     }
 
     private CartResponseDto buildCartResponse(Cart cart) {
-        List<CartItemResponseDto> itemDtos = cart.getItems().stream()
+        // Read items fresh from the repository rather than the entity's
+        // in-memory collection, which isn't kept in sync with add/remove
+        // operations done directly through cartItemRepository. The query
+        // auto-flushes pending inserts/deletes first, so this always reflects
+        // the true current cart state.
+        List<CartItemResponseDto> itemDtos = cartItemRepository.findByCartId(cart.getId()).stream()
                 .map(this::toItemDto)
                 .filter(java.util.Objects::nonNull)
                 .toList();
